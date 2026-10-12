@@ -1,0 +1,974 @@
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const dns = require('dns').promises;
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-this-password';
+if (ADMIN_PASSWORD === 'change-this-password') console.warn('WARNING: ADMIN_PASSWORD is not set, admin login is disabled.');
+const DATA_DIR = path.join(__dirname, 'data');
+const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+// Set UPLOAD_DIR to a Render persistent-disk path so uploaded photos survive redeploys.
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.set('trust proxy', 1);
+if (!fs.existsSync(PRODUCTS_FILE)) fs.writeFileSync(PRODUCTS_FILE, '[]');
+if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  if (req.path.startsWith('/admin') || req.path.startsWith('/api/admin')) {
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Cache-Control', 'no-store');
+  }
+  next();
+});
+app.use(express.json({ limit: '4mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.urlencoded({ extended: true }));
+
+// Allow the separate Cloudflare storefront to use this Render backend.
+const ALLOWED_ORIGINS = new Set([
+  'https://caayo-finds.covenantatafo4.workers.dev',
+  'https://caayo-finds.onrender.com'
+]);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Only serve the public pages and uploaded photos (never server.js or the data folder).
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/index.html', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '30d', immutable: true }));
+// Photos kept in the database (when DATABASE_URL is set) are served here.
+app.get('/uploads/:file', async (req, res) => {
+  const id = String(req.params.file);
+  if (!db || !/^[a-f0-9]{16}\.(jpg|png|webp)$/.test(id)) return res.sendStatus(404);
+  try {
+    const r = await db.query('SELECT mime, data FROM uploads WHERE id=$1', [id]);
+    if (!r.rows.length) return res.sendStatus(404);
+    res.set('Content-Type', r.rows[0].mime).set('Cache-Control', 'public, max-age=2592000, immutable').send(r.rows[0].data);
+  } catch { res.sendStatus(500); }
+});
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
+// ---------- Storage ----------
+// With DATABASE_URL set (e.g. a free Neon/Supabase Postgres), products, orders, settings and uploaded photos
+// live in the database and survive Render restarts, redeploys and sleep. Without it, local files are used (testing only).
+// The data is held in memory for fast reads and written through to the database on every change.
+let db = null;
+const KEYS = new Map([[PRODUCTS_FILE, 'products'], [ORDERS_FILE, 'orders'], [path.join(DATA_DIR, 'settings.json'), 'settings']]);
+const mem = {};
+const persistQueue = new Map();
+async function initStorage() {
+  if (!process.env.DATABASE_URL) { console.warn('WARNING: DATABASE_URL is not set. Data is stored in local files and is lost on Render free plan restarts.'); return; }
+  const { Pool } = require('pg');
+  const url = process.env.DATABASE_URL;
+  db = new Pool({ connectionString: url, max: 5, ssl: /@(localhost|127\.0\.0\.1)[:/]/.test(url) || process.env.DATABASE_SSL === 'off' ? false : { rejectUnauthorized: false } });
+  await db.query('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ DEFAULT now())');
+  await db.query('CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, mime TEXT NOT NULL, data BYTEA NOT NULL, created_at TIMESTAMPTZ DEFAULT now())');
+  for (const [file, key] of KEYS) {
+    const r = await db.query('SELECT value FROM kv WHERE key=$1', [key]);
+    if (r.rows.length) { mem[key] = r.rows[0].value; continue; }
+    // First run with a database: import anything already saved in the local files.
+    let initial = key === 'settings' ? {} : [];
+    try { initial = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    mem[key] = initial;
+    await db.query('INSERT INTO kv(key,value) VALUES($1,$2) ON CONFLICT (key) DO NOTHING', [key, JSON.stringify(initial)]);
+  }
+  console.log('Database connected: ' + KEYS.size + ' data sets loaded.');
+}
+function persist(key) {
+  const prev = persistQueue.get(key) || Promise.resolve();
+  const next = prev.then(() => db.query('INSERT INTO kv(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()', [key, JSON.stringify(mem[key])]))
+    .catch(e => console.error('DATABASE WRITE FAILED for ' + key + ':', e.message));
+  persistQueue.set(key, next);
+}
+function readJson(file) {
+  const key = KEYS.get(file);
+  if (db && key) return structuredClone(mem[key] ?? (key === 'settings' ? {} : []));
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return []; }
+}
+function writeJson(file, value) {
+  const key = KEYS.get(file);
+  if (db && key) { mem[key] = structuredClone(value); persist(key); return; }
+  fs.writeFileSync(file, JSON.stringify(value, null, 2));
+}
+function cleanText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+function escapeHtmlText(value) {
+  return cleanText(value).replace(/[<>]/g, '');
+}
+function makeId() { return crypto.randomBytes(8).toString('hex'); }
+function validPddUrl(value) {
+  try {
+    const u = new URL(value);
+    const host = u.hostname.toLowerCase();
+    return host.includes('yangkeduo.com') || host.includes('pinduoduo.com');
+  } catch { return false; }
+}
+function absoluteUrl(value, baseUrl) {
+  try {
+    const s = String(value || '').trim()
+      .replace(/\\u002F/g, '/')
+      .replace(/\\\//g, '/')
+      .replace(/&amp;/g, '&');
+    if (!s) return '';
+    return new URL(s, baseUrl).href;
+  } catch { return ''; }
+}
+function isImageUrl(value) {
+  try {
+    const u = new URL(value);
+    if (!/^https?:$/.test(u.protocol)) return false;
+    return /\.(?:jpg|jpeg|png|webp|gif|avif)(?:$|[?#])/i.test(u.pathname + u.search) ||
+      /\/(?:image|img|goods|upload|pic)\//i.test(u.pathname);
+  } catch { return false; }
+}
+function uniqueImages(list) {
+  const out=[]; const seen=new Set();
+  for (const item of list) {
+    const u=String(item||'').trim(); if(!u || !isImageUrl(u)) continue;
+    const key=u.split('#')[0]; if(!seen.has(key)){seen.add(key);out.push(u);}
+  }
+  return out.slice(0,30);
+}
+function stripHtml(value) {
+  return cleanText(String(value||'')
+    .replace(/<script[\s\S]*?<\/script>/gi,' ')
+    .replace(/<style[\s\S]*?<\/style>/gi,' ')
+    .replace(/<[^>]+>/g,' ')
+    .replace(/&nbsp;/gi,' ').replace(/&amp;/gi,'&').replace(/&quot;/gi,'"')
+    .replace(/&#39;/gi,"'").replace(/&lt;/gi,'<').replace(/&gt;/gi,'>'));
+}
+function extractMeta(html, key, attr='property') {
+  const safe=key.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\$&');
+  const re=new RegExp(`<meta[^>]+(?:${attr}=["']${safe}["'][^>]*content=["']([^"']*)["']|content=["']([^"']*)["'][^>]*${attr}=["']${safe}["'])[^>]*>`,'i');
+  const m=html.match(re); return cleanText(m?.[1]||m?.[2]||'');
+}
+function extractAttrImages(html, baseUrl) {
+  const images=[];
+  const re=/<(?:img|source)\b[^>]*(?:src|data-src|data-original|data-lazy-src|data-url)=["']([^"']+)["'][^>]*>/gi;
+  for(const m of html.matchAll(re)){const u=absoluteUrl(m[1],baseUrl);if(u)images.push(u);}
+  for(const m of html.matchAll(/https?:\/\/[^"'\s<>]+/gi)){const u=absoluteUrl(m[0].replace(/\\\//g,'/'),baseUrl);if(u&&isImageUrl(u))images.push(u);}
+  return uniqueImages(images);
+}
+function collectJsonLd(html, baseUrl) {
+  let title='',description='',sourcePrice=0; const imageUrls=[];
+  for(const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)){
+    try{
+      const parsed=JSON.parse(match[1].trim());
+      const items=Array.isArray(parsed)?parsed:[parsed];
+      const walk=item=>{
+        if(!item||typeof item!=='object')return;
+        if(!title&&item.name)title=cleanText(item.name);
+        if(!description&&item.description)description=stripHtml(item.description);
+        for(const img of (Array.isArray(item.image)?item.image:[item.image])){const u=absoluteUrl(img,baseUrl);if(u)imageUrls.push(u);}
+        const offers=Array.isArray(item.offers)?item.offers[0]:item.offers;
+        if(!sourcePrice&&offers?.price)sourcePrice=Number(String(offers.price).replace(/[^0-9.]/g,''))||0;
+        Object.values(item).forEach(v=>{if(v&&typeof v==='object')walk(v);});
+      };
+      items.forEach(walk);
+    }catch{}
+  }
+  return {title,description,sourcePrice,imageUrls:uniqueImages(imageUrls)};
+}
+function extractEmbeddedPddData(html, baseUrl) {
+  let title='',description='',sourcePrice=0; const images=[];
+  const pick=keys=>{
+    for(const key of keys){
+      const re=new RegExp(`["']${key}["']\\s*:\\s*["']([^"']{2,1000})["']`,'i');
+      const m=html.match(re);
+      if(m)return stripHtml(m[1].replace(/\\"/g,'"'));
+    }
+    return '';
+  };
+  title=pick(['goods_name','goodsName','goods_title','goodsTitle','name']);
+  description=pick(['desc','description','goods_desc','goodsDesc']);
+  const pm=html.match(/["'](?:price|goods_price|min_group_price)["']\s*:\s*["']?([0-9]+(?:\.[0-9]+)?)/i);
+  if(pm)sourcePrice=Number(pm[1])||0;
+  const arrayRe=/["'](?:item_imgs|itemImages|gallery|galleryImages|goods_gallery|detail_imgs)["']\s*:\s*\[([\s\S]{0,50000}?)\]/gi;
+  for(const m of html.matchAll(arrayRe)){
+    for(const u of m[1].matchAll(/["'](https?:\/\/[^"']+)["']/g)){
+      const a=absoluteUrl(u[1],baseUrl); if(a)images.push(a);
+    }
+  }
+  return {title,description,sourcePrice,imageUrls:uniqueImages(images)};
+}
+// ---------- Page fetching ----------
+const UA_MOBILE = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
+const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+function cleanMultiline(value) {
+  return String(value || '').replace(/[<>]/g, '').split('\n').map(l => l.replace(/[ \t\r]+/g, ' ').trim()).join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000);
+}
+// Any public http(s) link is allowed, but never the server's own network.
+async function checkPublicUrl(value) {
+  let u;
+  try { u = new URL(value); } catch { return { ok: false, error: 'Please paste a full product link starting with https://' }; }
+  if (!/^https?:$/.test(u.protocol)) return { ok: false, error: 'Please paste a full product link starting with https://' };
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (/^(localhost|.*\.local|.*\.internal)$/i.test(host)) return { ok: false, error: 'That address is not allowed.' };
+  try {
+    const addrs = await dns.lookup(host, { all: true });
+    const bad = a => /^(10\.|127\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a) || /^(::1|fc|fd|fe80)/i.test(a);
+    if (!addrs.length || addrs.some(x => bad(x.address))) return { ok: false, error: 'That address is not allowed.' };
+  } catch { return { ok: false, error: 'Could not find that website. Check the link.' }; }
+  return { ok: true };
+}
+function mobileUrl(inputUrl) {
+  try {
+    const u = new URL(inputUrl);
+    const id = u.searchParams.get('goods_id');
+    if (id && /yangkeduo|pinduoduo/i.test(u.hostname)) return 'https://mobile.yangkeduo.com/goods.html?goods_id=' + encodeURIComponent(id);
+  } catch {}
+  return inputUrl;
+}
+const isGenericTitle = t => !t || String(t).trim().length < 2 || /^(拼多多商城|拼多多|pinduoduo|yangkeduo|拼多多\s*[-|]\s*.*商城)$/i.test(String(t).trim());
+async function fetchOnce(url, ua) {
+  const r = await fetch(url, { redirect: 'follow', headers: {
+    'User-Agent': ua,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+    'Referer': 'https://mobile.yangkeduo.com/'
+  }, signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error(`The website returned HTTP ${r.status}`);
+  return { html: await r.text(), finalUrl: r.url || url };
+}
+function pageScore(html) {
+  if (/window\.rawData|goods_name|goodsName/.test(html)) return 3;
+  if (/"@type"\s*:\s*"Product"/i.test(html)) return 2;
+  const t = extractMeta(html, 'og:title') || cleanText((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '');
+  if (!isGenericTitle(t)) return 2;
+  return html.length > 500 ? 1 : 0;
+}
+// The original fetch from the first version of this server (kept exactly as it was).
+async function fetchProductPageOriginal(inputUrl) {
+  const response=await fetch(inputUrl,{redirect:'follow',headers:{
+    'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+    'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language':'en-US,en;q=0.9,zh-CN;q=0.8','Cache-Control':'no-cache'
+  },signal:AbortSignal.timeout(20000)});
+  if(!response.ok)throw new Error(`Pinduoduo returned HTTP ${response.status}`);
+  return {html:await response.text(),finalUrl:response.url||inputUrl};
+}
+// Try the original first. Only if it gets no real product page, try extra attempts (mobile browser, redirected goods_id).
+async function fetchProductPage(inputUrl) {
+  let best = null, lastErr = null;
+  try {
+    const first = await fetchProductPageOriginal(inputUrl);
+    first.score = pageScore(first.html);
+    if (first.score >= 2) return first;
+    best = first;
+  } catch (e) { lastErr = e; }
+  const attempts = [[mobileUrl(inputUrl), UA_MOBILE], [inputUrl, UA_MOBILE]];
+  if (best) { const m = mobileUrl(best.finalUrl); if (!attempts.some(a => a[0] === m)) attempts.push([m, UA_MOBILE]); }
+  for (let i = 0; i < attempts.length; i++) {
+    const [u, ua] = attempts[i];
+    try {
+      const res = await fetchOnce(u, ua);
+      res.score = pageScore(res.html);
+      if (!best || res.score > best.score) best = res;
+      if (res.score >= 2) return res;
+    } catch (e) { lastErr = e; }
+  }
+  if (best) return best;
+  throw lastErr || new Error('Could not load the page');
+}
+// Pinduoduo mobile pages embed the product as window.rawData = {...}
+function extractRawData(html) {
+  const i = html.search(/window\.rawData\s*=\s*/);
+  if (i < 0) return null;
+  const start = html.indexOf('{', i);
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let p = start; p < html.length; p++) {
+    const ch = html[p];
+    if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) { try { return JSON.parse(html.slice(start, p + 1)); } catch { return null; } } }
+  }
+  return null;
+}
+function readRawData(raw) {
+  const out = { title: '', description: '', sourcePrice: 0, details: [], shop: '', sales: '' };
+  if (!raw) return out;
+  const options = new Map();
+  const walk = (o, depth = 0) => {
+    if (!o || typeof o !== 'object' || depth > 9) return;
+    if (Array.isArray(o)) { o.forEach(v => walk(v, depth + 1)); return; }
+    const str = v => (typeof v === 'string' ? cleanText(v) : '');
+    if (!out.title) out.title = str(o.goodsName) || str(o.goods_name);
+    if (!out.description && typeof o.goodsDesc === 'string') out.description = stripHtml(o.goodsDesc);
+    if (!out.shop) out.shop = str(o.mallName) || str(o.mall_name);
+    if (!out.sales) out.sales = str(o.salesTip) || str(o.sales_tip);
+    for (const k of ['minGroupPrice', 'min_group_price', 'minOnSaleGroupPrice']) {
+      if (!out.sourcePrice && Number(o[k]) > 0) out.sourcePrice = Number(o[k]) / 100;   // prices are in fen
+    }
+    for (const k of ['goodsProperty', 'goods_property']) {
+      if (!Array.isArray(o[k])) continue;
+      for (const g of o[k]) {
+        const key = str(g && (g.key || g.name)); const val = Array.isArray(g && g.values) ? g.values.map(cleanText).join(', ') : str(g && (g.value || g.values));
+        if (key && val) out.details.push({ k: key, v: val });
+      }
+    }
+    if (Array.isArray(o.skus)) {
+      for (const sku of o.skus) for (const sp of (sku && (sku.specs || sku.spec) || [])) {
+        const k = str(sp && (sp.spec_key || sp.specKey)), v = str(sp && (sp.spec_value || sp.specValue));
+        if (k && v) { if (!options.has(k)) options.set(k, new Set()); options.get(k).add(v); }
+      }
+    }
+    for (const v of Object.values(o)) if (v && typeof v === 'object') walk(v, depth + 1);
+  };
+  walk(raw);
+  for (const [k, set] of options) out.details.push({ k: 'Options - ' + k, v: [...set].slice(0, 30).join(', ') });
+  return out;
+}
+function jsonLdDetails(html) {
+  const d = [];
+  for (const m of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const add = (k, v) => { v = (v && typeof v === 'object') ? cleanText(v.name || '') : cleanText(v); if (v) d.push({ k, v }); };
+      const walk = o => {
+        if (!o || typeof o !== 'object') return;
+        if (Array.isArray(o)) { o.forEach(walk); return; }
+        if (o['@type'] === 'Product' || o.sku) {
+          add('Brand', o.brand); add('SKU', o.sku); add('Category', o.category); add('Color', o.color); add('Material', o.material); add('Model', o.model);
+          for (const p of (Array.isArray(o.additionalProperty) ? o.additionalProperty : [])) if (p && p.name) add(cleanText(p.name), p.value);
+        }
+        Object.values(o).forEach(walk);
+      };
+      walk(JSON.parse(m[1].trim()));
+    } catch {}
+  }
+  return d;
+}
+// Everything the link can tell us (images are skipped on purpose, you upload your own).
+function extractProduct(html, finalUrl) {
+  const raw = readRawData(extractRawData(html));
+  const ld = collectJsonLd(html, finalUrl);
+  const emb = extractEmbeddedPddData(html, finalUrl);
+  const ogTitle = extractMeta(html, 'og:title');
+  const htmlTitle = cleanText((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '');
+  const title = [raw.title, ld.title, ogTitle, htmlTitle, emb.title].find(x => x && !isGenericTitle(x)) || '';
+  let description = title ? ([raw.description, ld.description, extractMeta(html, 'og:description'), extractMeta(html, 'description', 'name'), emb.description]
+    .find(x => x && String(x).trim().length > 3 && !isGenericTitle(x)) || '') : '';
+  const details = [...raw.details, ...jsonLdDetails(html)];
+  if (title) {
+    if (raw.shop) details.push({ k: 'Seller', v: raw.shop });
+    if (raw.sales) details.push({ k: 'Sales', v: raw.sales });
+    const kw = extractMeta(html, 'keywords', 'name');
+    if (kw && !isGenericTitle(kw)) details.push({ k: 'Keywords', v: kw });
+  }
+  const seen = new Set();
+  const uniq = details.filter(d => { const key = d.k + '|' + d.v; if (seen.has(key)) return false; seen.add(key); return true; }).slice(0, 40);
+  const sourcePrice = Number(raw.sourcePrice || ld.sourcePrice || emb.sourcePrice || String(extractMeta(html, 'product:price:amount') || extractMeta(html, 'og:price:amount')).replace(/[^0-9.]/g, '') || 0);
+  return { title, description, details: uniq, sourcePrice };
+}
+
+// ---------- Any language -> English ----------
+// Order tried: Google Cloud Translation (if GOOGLE_TRANSLATE_API_KEY is set), Google's free web endpoint, MyMemory.
+const needsTranslation = s => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Cyrillic}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Thai}\p{Script=Devanagari}\p{Script=Greek}\p{Script=Bengali}\p{Script=Tamil}]/u.test(String(s || ''));
+const hasChinese = s => /[\u3400-\u9fff\uf900-\ufaff]/.test(String(s || ''));
+const trCache = new Map();
+const trFail = new Map();
+const MAX_BYTES = 450;   // MyMemory allows 500 bytes per request, and Chinese characters use 3 bytes each
+function chunkText(text) {
+  const pieces = [];
+  let cur = '';
+  const push = () => { if (cur.trim()) pieces.push(cur); cur = ''; };
+  for (const token of String(text).split(/(?<=[。！？!?；;\n])/)) {
+    if (Buffer.byteLength(cur + token) > MAX_BYTES) push();
+    if (Buffer.byteLength(token) > MAX_BYTES) {
+      let part = '';
+      for (const ch of token) { if (Buffer.byteLength(part + ch) > MAX_BYTES) { pieces.push(part); part = ''; } part += ch; }
+      cur = part;
+    } else cur += token;
+  }
+  push();
+  return pieces;
+}
+async function translateChunk(q) {
+  const key = process.env.GOOGLE_TRANSLATE_API_KEY;
+  if (key) {
+    try {
+      const r = await fetch('https://translation.googleapis.com/language/translate/v2?key=' + encodeURIComponent(key), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ q, target: 'en', format: 'text' }), signal: AbortSignal.timeout(10000)
+      });
+      const d = await r.json();
+      const t = d && d.data && d.data.translations && d.data.translations[0] && d.data.translations[0].translatedText;
+      if (r.ok && t) return t;
+    } catch {}
+  }
+  try {
+    const r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=' + encodeURIComponent(q), {
+      headers: { 'User-Agent': UA_DESKTOP }, signal: AbortSignal.timeout(10000)
+    });
+    const d = await r.json();
+    const t = Array.isArray(d && d[0]) ? d[0].map(x => (x && x[0]) || '').join('') : '';
+    if (r.ok && t) return t;
+  } catch {}
+  const de = process.env.MYMEMORY_EMAIL ? '&de=' + encodeURIComponent(process.env.MYMEMORY_EMAIL) : '';
+  const pair = hasChinese(q) ? 'zh-CN|en' : 'Autodetect|en';
+  const r = await fetch('https://api.mymemory.translated.net/get?q=' + encodeURIComponent(q) + '&langpair=' + pair + de, { signal: AbortSignal.timeout(10000) });
+  const d = await r.json();
+  const t = d && d.responseData && d.responseData.translatedText;
+  if (!r.ok || !t || /MYMEMORY WARNING|INVALID|QUERY LENGTH/i.test(t)) throw new Error('All translation services failed or are rate-limited');
+  return t;
+}
+// force = translate even when the text looks Latin (used by the admin Translate button)
+async function toEnglish(text, force = false) {
+  const s = String(text || '').trim();
+  if (!s || (!force && !needsTranslation(s))) return s;
+  if (trCache.has(s)) return trCache.get(s);
+  const failed = trFail.get(s);
+  if (!force && failed && Date.now() - failed < 5 * 60 * 1000) return s;   // don't hammer a failing service
+  try {
+    let out = '';
+    for (const piece of chunkText(s)) {
+      const sep = /\n\s*$/.test(piece) ? '\n' : ' ';
+      const t = await translateChunk(piece.trim());
+      out += t.replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim() + sep;
+    }
+    const t = cleanMultiline(out);
+    if (t) { trCache.set(s, t); if (trCache.size > 2000) trCache.delete(trCache.keys().next().value); return t; }
+  } catch (e) {
+    console.warn('Translation failed:', e.message);
+    trFail.set(s, Date.now()); if (trFail.size > 500) trFail.delete(trFail.keys().next().value);
+  }
+  return s;   // never lose the original text if translation is unavailable
+}
+
+// ---------- Admin sessions (12-hour tokens, login attempts limited) ----------
+const DEFAULT_PASSWORD = 'change-this-password';
+const adminTokens = new Map();   // token -> expiry time
+const loginFails = new Map();    // ip -> { n, until }
+const TOKEN_TTL = 12 * 60 * 60 * 1000;
+function adminAuthed(token) {
+  const exp = adminTokens.get(token);
+  if (!exp) return false;
+  if (exp < Date.now()) { adminTokens.delete(token); return false; }
+  return true;
+}
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+function requireAdmin(req, res, next) {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
+  if (!token || !adminAuthed(token)) return res.status(401).json({ error: 'Admin login required' });
+  next();
+}
+
+app.post('/api/admin/login', (req, res) => {
+  const ip = req.ip;
+  let f = loginFails.get(ip);
+  if (f && f.until && f.until <= Date.now()) { loginFails.delete(ip); f = null; }
+  if (f && f.until > Date.now()) return res.status(429).json({ error: 'Too many wrong attempts. Try again in 15 minutes.' });
+  if (ADMIN_PASSWORD === DEFAULT_PASSWORD) {
+    return res.status(503).json({ error: 'Admin is locked until you set the ADMIN_PASSWORD environment variable on your server.' });
+  }
+  if (!req.body?.password || !safeEqual(req.body.password, ADMIN_PASSWORD)) {
+    const n = (f?.n || 0) + 1;
+    loginFails.set(ip, { n, until: n >= 5 ? Date.now() + 15 * 60 * 1000 : 0 });
+    return res.status(401).json({ error: 'Incorrect password' });
+  }
+  loginFails.delete(ip);
+  const token = crypto.randomBytes(24).toString('hex');
+  adminTokens.set(token, Date.now() + TOKEN_TTL);
+  res.json({ token });
+});
+
+app.post('/api/admin/logout', requireAdmin, (req, res) => {
+  adminTokens.delete(req.headers.authorization?.replace(/^Bearer\s+/i, ''));
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/translate', requireAdmin, async (req, res) => {
+  const out = {};
+  for (const k of ['name', 'description']) {
+    if (typeof req.body?.[k] === 'string') out[k] = await toEnglish(cleanMultiline(req.body[k]), true);
+  }
+  res.json({ ok: true, ...out });
+});
+
+// Public storefront product endpoint used by index.html.
+app.get('/api/products', async (req, res) => {
+  let products = readJson(PRODUCTS_FILE).filter(p => p.active !== false);
+  products = await Promise.all(products.map(async p => (needsTranslation(p.name) || needsTranslation(p.description))
+    ? { ...p, name: await toEnglish(p.name), description: await toEnglish(p.description) } : p));
+  const q = cleanText(req.query.q).toLowerCase();
+  if (q) products = products.filter(p => `${p.name} ${p.category}`.toLowerCase().includes(q));
+  res.json({ products });
+});
+
+// Photo upload from the admin page (images are resized in the browser first).
+app.post('/api/admin/upload', requireAdmin, async (req, res) => {
+  const m = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(String(req.body?.data || ''));
+  if (!m) return res.status(400).json({ error: 'Send a JPEG, PNG or WebP image.' });
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length > 3 * 1024 * 1024) return res.status(413).json({ error: 'Image is too large (max 3 MB).' });
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const file = makeId() + '.' + ext;
+  try {
+    if (db) await db.query('INSERT INTO uploads(id, mime, data) VALUES($1,$2,$3)', [file, 'image/' + m[1], buf]);
+    else fs.writeFileSync(path.join(UPLOAD_DIR, file), buf);
+  } catch (e) { console.error('Upload save failed:', e.message); return res.status(500).json({ error: 'Could not save the image. Try again.' }); }
+  const base = (process.env.PUBLIC_URL || (req.protocol + '://' + req.get('host'))).replace(/\/$/, '');
+  res.json({ ok: true, url: base + '/uploads/' + file });
+});
+
+app.get('/api/admin/products', requireAdmin, (req, res) => {
+  res.json({ products: readJson(PRODUCTS_FILE) });
+});
+
+// Import product data from a public Pinduoduo/Yangkeduo URL. No Pinduoduo API key is used.
+app.post('/api/admin/import-url', requireAdmin, async (req, res) => {
+  const url=cleanText(req.body?.url);
+  const check=await checkPublicUrl(url);
+  if(!check.ok)return res.status(400).json({error:check.error});
+  try{
+    const {html,finalUrl}=await fetchProductPage(url);
+    // ---- original extraction (unchanged) ----
+    const ogTitle=extractMeta(html,'og:title');
+    const metaDescription=extractMeta(html,'description','name');
+    const ogDescription=extractMeta(html,'og:description');
+    const ogImage=absoluteUrl(extractMeta(html,'og:image'),finalUrl);
+    const jsonLd=collectJsonLd(html,finalUrl);
+    const embedded=extractEmbeddedPddData(html,finalUrl);
+    let images=uniqueImages([ogImage,...jsonLd.imageUrls,...embedded.imageUrls,...extractAttrImages(html,finalUrl)]);
+    // ---- additions: extra details, translation, and not saving Pinduoduo's own logo as a product ----
+    let rawD={title:'',description:''}, extra={details:[],sourcePrice:0};
+    try{rawD=readRawData(extractRawData(html));extra=extractProduct(html,finalUrl);}catch{}
+    const htmlTitle=cleanText((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)||[])[1]||'');
+    const rawTitle=[rawD.title,ogTitle,jsonLd.title,embedded.title,htmlTitle].find(t=>t&&!isGenericTitle(t))||'';
+    const blocked=!rawTitle;
+    images=images.filter(u=>!/share_logo|\/base\/|favicon/i.test(u));
+    if(blocked)images=[];
+    const baseDescription=blocked?'':(rawD.description||embedded.description||jsonLd.description||ogDescription||metaDescription||'');
+    const detailText=blocked?'':extra.details.map(d=>`${d.k}: ${d.v}`).join('\n');
+    const fullText=[cleanMultiline(baseDescription),detailText?'Details:\n'+detailText:''].filter(Boolean).join('\n\n');
+    const title=blocked?'':((await toEnglish(escapeHtmlText(rawTitle)))||escapeHtmlText(rawTitle));
+    const description=fullText?await toEnglish(fullText):'';
+    const sourcePrice=blocked?0:Number(extra.sourcePrice||embedded.sourcePrice||jsonLd.sourcePrice||req.body?.sourcePrice||0);
+    const products=readJson(PRODUCTS_FILE);
+    const existing=products.find(p=>p.sourceUrl===url||p.sourceUrl===finalUrl||p.originalUrl===url);
+    if(!images.length&&existing?.images?.length)images=existing.images;
+    res.json({ok:true,existingId:existing?.id||null,blocked,product:{
+      id:existing?.id||makeId(),sourceUrl:finalUrl,originalUrl:url,name:title,image:images[0]||'',images,
+      description,sourcePrice,caayoPrice:Number(req.body?.caayoPrice||existing?.caayoPrice||0),
+      category:cleanText(req.body?.category||existing?.category||'New finds'),active:existing?existing.active!==false:true
+    },note:blocked
+      ?'The website did not give us the product details (Pinduoduo often blocks servers). Type the name and description, then tap Translate. Your uploaded photos are kept.'
+      :`Imported the name, description${extra.details.length?`, ${extra.details.length} detail line${extra.details.length===1?'':'s'}`:''}${sourcePrice?' and price':''}${images.length?` and ${images.length} image${images.length===1?'':'s'}`:''}. Anything not in English was translated. Review the text, upload your photos and set your CAAYO price.`,
+      translationNote:''});
+  }catch(err){res.status(502).json({error:'Could not read this link automatically.',detail:err.message,fallback:'The site may be blocking automated requests. Keep the URL and use the manual product fields in the admin form.'});}
+});
+
+app.post('/api/admin/products', requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const products = readJson(PRODUCTS_FILE);
+  const product = {
+    id: cleanText(body.id) || makeId(),
+    sourceUrl: cleanText(body.sourceUrl),
+    originalUrl: cleanText(body.originalUrl),
+    name: await toEnglish(escapeHtmlText(body.name)) || 'Untitled product',
+    image: cleanText(body.image) || (Array.isArray(body.images) ? cleanText(body.images[0]) : ''),
+    images: uniqueImages([cleanText(body.image), ...(Array.isArray(body.images) ? body.images : [])]),
+    description: await toEnglish(cleanMultiline(body.description)),
+    sourcePrice: Number(body.sourcePrice || 0),
+    caayoPrice: Number(body.caayoPrice || 0),
+    category: escapeHtmlText(body.category) || 'New finds',
+    rating: Number(body.rating) > 0 ? Math.min(5, Number(body.rating)) : undefined,
+    reviews: escapeHtmlText(body.reviews || ''),
+    weightKg: Math.min(100, Math.max(0.01, Number(body.weightKg) || 0.5)),
+    shippingClass: body.shippingClass === 'special' ? 'special' : 'normal',
+    sizeType: ['none', 'shoes_adult', 'shoes_kids', 'clothing', 'clothing_kids', 'trousers', 'custom'].includes(body.sizeType) ? body.sizeType : 'none',
+    sizes: (Array.isArray(body.sizes) ? body.sizes : []).slice(0, 60).map(x => cleanText(x).slice(0, 14)).filter(Boolean),
+    colors: (Array.isArray(body.colors) ? body.colors : []).slice(0, 20).map(c => ({ name: cleanText(c && c.name).slice(0, 30), hex: /^#[0-9a-f]{6}$/i.test(String(c && c.hex)) ? String(c.hex).toLowerCase() : '#999999', image: cleanText(c && c.image).slice(0, 500) })).filter(c => c.name),
+    active: body.active !== false,
+    updatedAt: new Date().toISOString()
+  };
+  if (!product.caayoPrice || product.caayoPrice < 0) return res.status(400).json({ error: 'Enter a CAAYO selling price.' });
+  const idx = products.findIndex(p => p.id === product.id || (product.sourceUrl && p.sourceUrl === product.sourceUrl));
+  if (idx >= 0) products[idx] = { ...products[idx], ...product };
+  else products.unshift({ ...product, createdAt: new Date().toISOString() });
+  writeJson(PRODUCTS_FILE, products);
+  res.json({ ok: true, product });
+});
+
+app.delete('/api/admin/products/:id', requireAdmin, (req, res) => {
+  const products = readJson(PRODUCTS_FILE);
+  const next = products.filter(p => String(p.id) !== String(req.params.id));
+  writeJson(PRODUCTS_FILE, next);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/orders', requireAdmin, (req, res) => {
+  res.json({ orders: readJson(ORDERS_FILE) });
+});
+
+// Public single-product endpoint.
+app.get('/api/products/:id', (req, res) => {
+  const p = readJson(PRODUCTS_FILE).find(x => String(x.id) === String(req.params.id) && x.active !== false);
+  if (!p) return res.status(404).json({ error: 'Product not found' });
+  res.json({ product: p });
+});
+
+// ---------- Delivery, shipping and settings ----------
+const STATES = ["Lagos", "Delta", "Ondo", "Edo", "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa", "Benue", "Borno", "Cross River", "Ebonyi", "Ekiti", "Enugu", "FCT (Abuja)", "Gombe", "Imo", "Jigawa", "Kaduna", "Kano", "Katsina", "Kebbi", "Kogi", "Kwara", "Nasarawa", "Niger", "Ogun", "Osun", "Oyo", "Plateau", "Rivers", "Sokoto", "Taraba", "Yobe", "Zamfara"];
+const LOCAL_STATES = ['Lagos', 'Delta', 'Ondo', 'Edo'];
+const SUPPORT_PHONE = process.env.SUPPORT_PHONE || '+2349055810160';
+const EXPRESS_USD_PER_KG = { normal: 9, special: 21 };   // express shipping: normal items vs special/battery items
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');   // (also registered in KEYS above)
+// Home page banners: up to 5 slides, each with a picture and text. Blank fields fall back to the built-in default on the storefront.
+function cleanBanners(list) {
+  return (Array.isArray(list) ? list : []).slice(0, 5).map(b => {
+    b = b || {};
+    const img = cleanText(b.image).slice(0, 500);
+    return {
+      image: /^(https?:\/\/|\/uploads\/)/i.test(img) ? img : '',
+      eyebrow: escapeHtmlText(b.eyebrow).slice(0, 40),
+      headline: cleanMultiline(b.headline).slice(0, 80),
+      text: escapeHtmlText(b.text).slice(0, 120),
+      button: escapeHtmlText(b.button).slice(0, 24),
+      link: cleanText(b.link).slice(0, 60)
+    };
+  });
+}
+function readSettings() {
+  let s = readJson(SETTINGS_FILE);
+  if (!s || Array.isArray(s)) s = {};
+  const num = (v, d) => (v !== undefined && v !== null && v !== '' && Number(v) >= 0 ? Number(v) : d);
+  const envRate = Number(process.env.USD_NGN_RATE);
+  const legacyFee = num(s.dispatchFee, Number(process.env.DISPATCH_FEE_NGN) || 0);
+  return {
+    usdRate: Number(s.usdRate) > 0 ? Number(s.usdRate) : (envRate > 0 ? envRate : 1500),
+    freeThreshold: num(s.freeThreshold, 100000),          // door delivery is free at or above this order value
+    doorFeeLocal: num(s.doorFeeLocal, 0),                 // door delivery fee: Lagos, Delta, Ondo, Edo
+    doorFeeOther: num(s.doorFeeOther, legacyFee),         // door delivery fee: all other states
+    thresholdAllStates: s.thresholdAllStates === true,    // does the free-delivery minimum also apply to the other states?
+    pickupPoints: Array.isArray(s.pickupPoints) ? s.pickupPoints : [],
+    banners: cleanBanners(s.banners)                       // home page banners (picture + text) edited in admin
+  };
+}
+const publicPickups = () => readSettings().pickupPoints.map(p => ({ id: p.id, name: p.name, state: p.state, area: p.area, address: p.address }));
+// The server always works the price out itself, so the browser can never change what a customer pays.
+function computeQuote(lines, products, state, method, deliveryType) {
+  const subtotal = lines.reduce((n, l) => n + l.price * l.quantity, 0);
+  const kg = { normal: 0, special: 0 };
+  for (const l of lines) {
+    const p = products.find(x => String(x.id) === String(l.id)) || {};
+    kg[p.shippingClass === 'special' ? 'special' : 'normal'] += (Number(p.weightKg) || 0.5) * l.quantity;
+  }
+  const st = readSettings();
+  const expressFee = method === 'express' ? Math.ceil(Math.round((kg.normal * EXPRESS_USD_PER_KG.normal + kg.special * EXPRESS_USD_PER_KG.special) * st.usdRate * 100) / 100) : 0;
+  // Door delivery is paid unless the order reaches the free-delivery minimum. Pickup is always free.
+  let dispatchFee = 0, dispatchPending = false, doorWaived = false;
+  if (deliveryType !== 'pickup') {
+    const local = LOCAL_STATES.includes(state);
+    const base = local ? st.doorFeeLocal : st.doorFeeOther;
+    if (subtotal >= st.freeThreshold && (local || st.thresholdAllStates)) doorWaived = true;
+    else { dispatchFee = base; dispatchPending = !base; }
+  }
+  return { subtotal, kg: { normal: Math.round(kg.normal * 100) / 100, special: Math.round(kg.special * 100) / 100 }, expressFee, dispatchFee,
+    dispatchPending, doorWaived, total: subtotal + expressFee + dispatchFee, usdRate: st.usdRate };
+}
+function etaFor(method, from = new Date()) {
+  const [a, b] = method === 'express' ? [7, 10] : [60, 90];   // express 7-10 days, standard 2-3 months
+  const at = d => new Date(from.getTime() + d * 864e5);
+  const fmt = d => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  return { from: at(a).toISOString(), to: at(b).toISOString(), text: fmt(at(a)) + ' to ' + fmt(at(b)) };
+}
+
+// ---------- Order status updates (emailed to the customer) ----------
+const STAGES = [
+  { key: 'placed', label: 'Order placed', msg: 'You just ordered this product. We have received your order and we are getting it ready.' },
+  { key: 'packaged', label: 'Packaged', msg: 'Your product has been packaged and is being transported to the port.', msgExpress: 'Your product has been packaged and is being transported to the shipping hub.' },
+  { key: 'loaded', label: 'Loaded', msg: 'Your package has been loaded onto the ship.', msgExpress: 'Your package has been loaded for express shipping to Nigeria.' },
+  { key: 'departed', label: 'On its way to Nigeria', msg: 'Your package has left the port and is on its way to Nigeria.', msgExpress: 'Your package has left and is on its way to Nigeria.' },
+  { key: 'arrived', label: 'Arrived in Nigeria', msg: 'Your package has arrived in Nigeria and is being sorted for delivery.' },
+  { key: 'out_for_delivery', label: 'Out for delivery', msg: 'Your package is out for delivery to your address. Please keep your phone close.', msgPickup: 'Your package is ready for pickup at {point}. Please bring your order ID.', labelPickup: 'Ready for pickup' },
+  { key: 'delivered', label: 'Delivered', msg: 'Your package has been delivered. Thank you for shopping with CAAYO!', msgPickup: 'Your package has been collected. Thank you for shopping with CAAYO!', labelPickup: 'Collected' }
+];
+const h = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const variantText = l => (l.color || l.size) ? ' (' + [l.color, l.size ? 'size ' + l.size : ''].filter(Boolean).join(', ') + ')' : '';
+const money = n => '₦' + Math.round(Number(n) || 0).toLocaleString('en-NG');
+const emailConfigured = () => !!((process.env.BREVO_API_KEY || process.env.RESEND_API_KEY) && process.env.EMAIL_FROM);
+// Sends through an email API (Brevo or Resend). Render's free plan blocks normal SMTP, so we use their web APIs.
+async function sendEmail({ to, subject, html, text }) {
+  const from = String(process.env.EMAIL_FROM || '').trim();
+  const m = /^(.*?)\s*<([^>]+)>$/.exec(from);
+  const fromName = (m && m[1].replace(/^"|"$/g, '')) || 'CAAYO';
+  const fromEmail = m ? m[2] : from;
+  if (!fromEmail) return { ok: false, error: 'EMAIL_FROM is not set' };
+  try {
+    if (process.env.BREVO_API_KEY) {
+      const r = await fetch('https://api.brevo.com/v3/smtp/email', { method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ sender: { name: fromName, email: fromEmail }, to: [{ email: to }], subject, htmlContent: html, textContent: text }),
+        signal: AbortSignal.timeout(15000) });
+      if (!r.ok) throw new Error('Brevo ' + r.status + ' ' + (await r.text()).slice(0, 160));
+      return { ok: true };
+    }
+    if (process.env.RESEND_API_KEY) {
+      const r = await fetch('https://api.resend.com/emails', { method: 'POST',
+        headers: { Authorization: 'Bearer ' + process.env.RESEND_API_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ from: fromName + ' <' + fromEmail + '>', to: [to], subject, html, text }),
+        signal: AbortSignal.timeout(15000) });
+      if (!r.ok) throw new Error('Resend ' + r.status + ' ' + (await r.text()).slice(0, 160));
+      return { ok: true };
+    }
+    return { ok: false, error: 'No email service is set up (add BREVO_API_KEY or RESEND_API_KEY)' };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+function orderEmail(order, stageKey) {
+  const st = STAGES.find(s => s.key === stageKey) || STAGES[0];
+  const express = order.shipping && order.shipping.method === 'express';
+  const pickup = order.delivery && order.delivery.type === 'pickup';
+  let msg = express && st.msgExpress ? st.msgExpress : st.msg;
+  if (pickup && st.msgPickup) msg = st.msgPickup.replace('{point}', (order.delivery && order.delivery.pointName) || 'your pickup point');
+  const track = (order.origin || '') + '/?track=' + encodeURIComponent(order.id);
+  const idx = STAGES.findIndex(s => s.key === st.key);
+  const steps = STAGES.map((s, i) => `<td style="padding:0 2px"><div style="height:5px;border-radius:5px;background:${i <= idx ? '#000' : '#ddd'}"></div></td>`).join('');
+  const rows = (order.lines || []).map(l => `<tr><td style="padding:6px 0">${h(l.name)}${h(variantText(l))} × ${l.quantity}</td><td align="right" style="padding:6px 0">${money(l.price * l.quantity)}</td></tr>`).join('');
+  const extra = [
+    order.shipping && order.shipping.expressFee ? `<tr><td style="padding:4px 0;color:#666">Express shipping</td><td align="right">${money(order.shipping.expressFee)}</td></tr>` : '',
+    order.dispatchFee ? `<tr><td style="padding:4px 0;color:#666">Dispatch fee</td><td align="right">${money(order.dispatchFee)}</td></tr>` : ''
+  ].join('');
+  const c = order.customer || {};
+  const labelShown = (pickup && st.labelPickup) || st.label;
+  const html = `<div style="background:#f4f4f4;padding:20px;font-family:Arial,Helvetica,sans-serif;color:#111"><div style="max-width:520px;margin:auto;background:#fff;border-radius:14px;overflow:hidden">
+<div style="background:#000;color:#fff;text-align:center;padding:18px;font-size:26px;font-weight:900;letter-spacing:-1px">CAAYO</div>
+<div style="padding:22px"><div style="font-size:12px;color:#777;letter-spacing:.06em;text-transform:uppercase">${h(labelShown)}</div>
+<p style="font-size:18px;line-height:1.45;margin:8px 0 14px">${h(msg)}</p>
+<table width="100%" cellspacing="0" cellpadding="0" style="margin:10px 0 16px"><tr>${steps}</tr></table>
+${order.eta && order.eta.text ? `<p style="margin:0 0 16px;font-size:14px">Estimated arrival: <b>${h(order.eta.text)}</b> (${express ? 'Express' : 'Standard'} shipping)</p>` : ''}
+<a href="${h(track)}" style="display:inline-block;background:#000;color:#fff;text-decoration:none;padding:12px 20px;border-radius:999px;font-weight:700;font-size:14px">Track my order</a>
+<p style="margin:20px 0 6px;font-size:13px;color:#777">Order ${h(order.id)}</p>
+<table width="100%" cellspacing="0" cellpadding="0" style="font-size:14px;border-top:1px solid #eee">${rows}${extra}<tr><td style="padding:8px 0;border-top:1px solid #eee"><b>Total</b></td><td align="right" style="border-top:1px solid #eee"><b>${money(order.total)}</b></td></tr></table>
+<p style="font-size:13px;color:#555;margin:16px 0 0"><b>${pickup ? 'Pickup at:' : 'Delivering to:'}</b> ${h(pickup ? [order.delivery.pointName, c.address, c.city, c.state].filter(Boolean).join(', ') : [c.name, c.address, c.city, c.state].filter(Boolean).join(', '))}</p>
+<p style="font-size:13px;color:#555;margin:14px 0 0">Questions? WhatsApp or call ${h(SUPPORT_PHONE)}.</p></div></div></div>`;
+  const text = `CAAYO - ${labelShown}\n\n${msg}\n${order.eta && order.eta.text ? 'Estimated arrival: ' + order.eta.text + '\n' : ''}Order ${order.id}, total ${money(order.total)}\nTrack: ${track}\nQuestions? ${SUPPORT_PHONE}`;
+  return { subject: `CAAYO order ${order.id}: ${labelShown}`, html, text };
+}
+async function notifyOrder(orderId, stageKey) {
+  const order = readJson(ORDERS_FILE).find(o => o.id === orderId);
+  if (!order || !order.email) return { ok: false, error: 'This order has no email address' };
+  const result = await sendEmail({ to: order.email, ...orderEmail(order, stageKey) });
+  if (!result.ok) console.warn('Order email failed:', result.error);
+  const orders = readJson(ORDERS_FILE);
+  const o = orders.find(x => x.id === orderId);
+  if (o) { (o.emails = o.emails || []).push({ stage: stageKey, at: new Date().toISOString(), ok: result.ok, error: result.error }); writeJson(ORDERS_FILE, orders); }
+  return result;
+}
+
+// ---------- Paystack ----------
+// Set PAYSTACK_SECRET_KEY (sk_test_... or sk_live_...) in your server's environment. Never put it in code.
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || '';
+async function paystack(method, endpoint, body) {
+  const r = await fetch('https://api.paystack.co' + endpoint, {
+    method, headers: { Authorization: 'Bearer ' + PAYSTACK_SECRET, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(20000)
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.status) throw new Error(d.message || 'Paystack error ' + r.status);
+  return d.data;
+}
+// Marks an order paid only after Paystack confirms the money and the amount matches. The first time, it emails the customer.
+function settleOrder(reference, tx) {
+  const orders = readJson(ORDERS_FILE);
+  const order = orders.find(o => o.id === reference);
+  if (!order) return null;
+  if (order.status !== 'paid' && tx && tx.status === 'success' && tx.currency === 'NGN' && Number(tx.amount) >= Math.round(order.total * 100)) {
+    order.status = 'paid';
+    order.paidAt = new Date().toISOString();
+    order.paystackId = tx.id;
+    order.stage = 'placed';
+    (order.timeline = order.timeline || []).push({ stage: 'placed', at: order.paidAt });
+    writeJson(ORDERS_FILE, orders);
+    notifyOrder(order.id, 'placed').catch(() => {});
+  }
+  return order;
+}
+const maskEmail = e => String(e || '').replace(/^(.).*(@.*)$/, '$1***$2');
+
+app.get('/api/config', (req, res) => {
+  const st = readSettings();
+  res.json({ usdRate: st.usdRate, freeThreshold: st.freeThreshold, doorFeeLocal: st.doorFeeLocal, doorFeeOther: st.doorFeeOther,
+    thresholdAllStates: st.thresholdAllStates, pickupPoints: publicPickups(), expressPerKg: EXPRESS_USD_PER_KG, localStates: LOCAL_STATES, whatsapp: SUPPORT_PHONE, banners: st.banners });
+});
+
+// Order endpoint used by the storefront checkout. Guest checkout: no account, the email is where updates are sent.
+app.post('/api/orders', async (req, res) => {
+  const body = req.body || {};
+  const products = readJson(PRODUCTS_FILE);
+  const lines = [];
+  for (const it of Array.isArray(body.items) ? body.items : []) {
+    const qty = Math.max(1, Math.min(99, parseInt(it.quantity, 10) || 0));
+    const p = products.find(x => String(x.id) === String(it.id) && x.active !== false);
+    if (!p || !qty) continue;
+    const colors = Array.isArray(p.colors) ? p.colors : [], sizes = Array.isArray(p.sizes) ? p.sizes : [];
+    const colorHit = colors.find(c => c.name.toLowerCase() === cleanText(it.color).toLowerCase());
+    const sizeHit = sizes.find(z => z === cleanText(it.size));
+    if (colors.length && !colorHit) return res.status(400).json({ error: 'Please choose a colour for ' + p.name + '.' });
+    if (sizes.length && !sizeHit) return res.status(400).json({ error: 'Please choose a size for ' + p.name + '.' });
+    lines.push({ id: p.id, name: p.name, price: Number(p.caayoPrice) || 0, quantity: qty, color: colorHit ? colorHit.name : '', size: sizeHit || '' });
+  }
+  const c = body.customer || {};
+  const email = cleanText(body.email);
+  const method = body.shippingMethod === 'express' ? 'express' : 'standard';
+  if (!lines.length) return res.status(400).json({ error: 'Your cart has no available products. Refresh and try again.' });
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address. Your order updates are sent there.' });
+  if (!cleanText(c.name) || !cleanText(c.phone)) return res.status(400).json({ error: 'Name and phone are required.' });
+  const pickupMode = body.deliveryType === 'pickup';
+  let customer, delivery;
+  if (pickupMode) {
+    const pt = readSettings().pickupPoints.find(p => p.id === cleanText(body.pickupId));
+    if (!pt) return res.status(400).json({ error: 'Please choose a pickup point.' });
+    customer = { name: cleanText(c.name), phone: cleanText(c.phone), state: pt.state, city: pt.area, address: pt.address };
+    delivery = { type: 'pickup', pointId: pt.id, pointName: pt.name };
+  } else {
+    if (!cleanText(c.address)) return res.status(400).json({ error: 'Delivery address is required.' });
+    if (!STATES.includes(cleanText(c.state))) return res.status(400).json({ error: 'Please choose your delivery state.' });
+    customer = { name: cleanText(c.name), phone: cleanText(c.phone), state: cleanText(c.state), city: cleanText(c.city), address: cleanText(c.address) };
+    delivery = { type: 'door' };
+  }
+  const q = computeQuote(lines, products, customer.state, method, delivery.type);
+  const origin = ALLOWED_ORIGINS.has(req.headers.origin) ? req.headers.origin : (process.env.PUBLIC_URL || req.protocol + '://' + req.get('host')).replace(/\/$/, '');
+  const order = {
+    id: 'ORD-' + Date.now() + crypto.randomBytes(2).toString('hex'),
+    email,
+    customer, delivery,
+    lines, subtotal: q.subtotal,
+    shipping: { method, kg: q.kg, expressFee: q.expressFee, usdRate: q.usdRate },
+    dispatchFee: q.dispatchFee, dispatchPending: q.dispatchPending,
+    total: q.total, eta: etaFor(method), origin,
+    status: 'pending', stage: '', timeline: [], emails: [], createdAt: new Date().toISOString()
+  };
+  const orders = readJson(ORDERS_FILE);
+  orders.unshift(order);
+  writeJson(ORDERS_FILE, orders);
+  if (!PAYSTACK_SECRET) {
+    order.stage = 'placed';
+    order.timeline.push({ stage: 'placed', at: order.createdAt });
+    writeJson(ORDERS_FILE, orders);
+    notifyOrder(order.id, 'placed').catch(() => {});
+    return res.json({ ok: true, orderId: order.id, total: q.total, email: maskEmail(email), message: 'Order received. Payment is not switched on yet.' });
+  }
+  try {
+    const tx = await paystack('POST', '/transaction/initialize', {
+      email, amount: Math.round(q.total * 100), currency: 'NGN', reference: order.id,
+      callback_url: origin + '/', metadata: { orderId: order.id, customer: order.customer.name, phone: order.customer.phone, delivery: delivery.type }
+    });
+    res.json({ ok: true, orderId: order.id, total: q.total, paymentUrl: tx.authorization_url });
+  } catch (e) {
+    console.warn('Paystack initialize failed:', e.message);
+    res.status(502).json({ error: 'Could not start payment. Please try again in a moment.' });
+  }
+});
+
+// The storefront calls this when the customer returns from Paystack. We ask Paystack directly, we never trust the browser.
+app.get('/api/paystack/verify/:reference', async (req, res) => {
+  const reference = cleanText(req.params.reference);
+  if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'Payments are not switched on.' });
+  try {
+    const tx = await paystack('GET', '/transaction/verify/' + encodeURIComponent(reference));
+    const order = settleOrder(reference, tx);
+    if (!order) return res.status(404).json({ error: 'Order not found.' });
+    res.json({ ok: true, paid: order.status === 'paid', orderId: order.id, total: order.total, count: order.lines.reduce((n, l) => n + l.quantity, 0), email: maskEmail(order.email) });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not confirm payment yet.' });
+  }
+});
+
+// Paystack calls this too, so orders are marked paid even if the customer closes the browser before returning.
+app.post('/api/paystack/webhook', (req, res) => {
+  if (!PAYSTACK_SECRET || !req.rawBody) return res.sendStatus(400);
+  const expected = crypto.createHmac('sha512', PAYSTACK_SECRET).update(req.rawBody).digest('hex');
+  const got = String(req.headers['x-paystack-signature'] || '');
+  if (got.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected))) return res.sendStatus(401);
+  const ev = req.body || {};
+  if (ev.event === 'charge.success' && ev.data && ev.data.reference) settleOrder(ev.data.reference, ev.data);
+  res.sendStatus(200);
+});
+
+// Customers track an order with the order ID plus the email they used at checkout (no account needed).
+const trackHits = new Map();
+app.get('/api/track', (req, res) => {
+  const now = Date.now();
+  const hit = trackHits.get(req.ip) || { n: 0, t: now };
+  if (now - hit.t > 60000) { hit.n = 0; hit.t = now; }
+  hit.n++; trackHits.set(req.ip, hit);
+  if (trackHits.size > 5000) trackHits.clear();
+  if (hit.n > 20) return res.status(429).json({ error: 'Too many tries. Please wait a minute.' });
+  const id = cleanText(req.query.id).toLowerCase();
+  const email = cleanText(req.query.email).toLowerCase();
+  const o = readJson(ORDERS_FILE).find(x => String(x.id).toLowerCase() === id);
+  if (!o || !email || String(o.email || '').toLowerCase() !== email) return res.status(404).json({ error: 'We could not find an order with that ID and email.' });
+  res.json({ ok: true, order: { id: o.id, status: o.status, stage: o.stage || '', timeline: o.timeline || [], eta: o.eta || null,
+    method: o.shipping && o.shipping.method, delivery: o.delivery || { type: 'door' }, state: o.customer && o.customer.state, area: o.customer && o.customer.city, total: o.total,
+    lines: (o.lines || []).map(l => ({ name: l.name, quantity: l.quantity, color: l.color || '', size: l.size || '' })), createdAt: o.createdAt, stages: STAGES.map(s => ({ key: s.key, label: (o.delivery && o.delivery.type === 'pickup' && s.labelPickup) || s.label })) } });
+});
+
+// Admin: move an order to the next stage and email the customer.
+app.post('/api/admin/orders/:id/stage', requireAdmin, async (req, res) => {
+  const stage = cleanText(req.body && req.body.stage);
+  if (!STAGES.some(s => s.key === stage)) return res.status(400).json({ error: 'Unknown stage' });
+  const orders = readJson(ORDERS_FILE);
+  const o = orders.find(x => x.id === req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  o.stage = stage;
+  (o.timeline = o.timeline || []).push({ stage, at: new Date().toISOString() });
+  writeJson(ORDERS_FILE, orders);
+  let email = { ok: false, error: 'Email not sent' };
+  if (!req.body || req.body.notify !== false) email = await notifyOrder(o.id, stage);
+  res.json({ ok: true, email, order: readJson(ORDERS_FILE).find(x => x.id === o.id) });
+});
+
+app.get('/api/admin/settings', requireAdmin, (req, res) => {
+  res.json({ ...readSettings(), emailOn: emailConfigured(), paystackOn: !!PAYSTACK_SECRET });
+});
+app.post('/api/admin/settings', requireAdmin, (req, res) => {
+  const cur = readSettings(), b = req.body || {};
+  const num = (v, d) => (v !== undefined && v !== null && v !== '' && Number(v) >= 0 ? Number(v) : d);
+  const points = Array.isArray(b.pickupPoints)
+    ? b.pickupPoints.slice(0, 30).map((p, i) => ({ id: 'pp' + (i + 1), name: cleanText(p && p.name).slice(0, 80), state: STATES.includes(cleanText(p && p.state)) ? cleanText(p.state) : '', area: cleanText(p && p.area).slice(0, 80), address: cleanText(p && p.address).slice(0, 200) })).filter(p => p.name)
+    : cur.pickupPoints;
+  writeJson(SETTINGS_FILE, {
+    usdRate: Number(b.usdRate) > 0 ? Number(b.usdRate) : cur.usdRate,
+    freeThreshold: num(b.freeThreshold, cur.freeThreshold),
+    doorFeeLocal: num(b.doorFeeLocal, cur.doorFeeLocal),
+    doorFeeOther: num(b.doorFeeOther, cur.doorFeeOther),
+    thresholdAllStates: typeof b.thresholdAllStates === 'boolean' ? b.thresholdAllStates : cur.thresholdAllStates,
+    pickupPoints: points,
+    banners: Array.isArray(b.banners) ? cleanBanners(b.banners) : cur.banners
+  });
+  res.json({ ok: true, ...readSettings(), emailOn: emailConfigured(), paystackOn: !!PAYSTACK_SECRET });
+});
+
+app.get('/health', (req, res) => res.json({ ok: true, products: readJson(PRODUCTS_FILE).length, storage: db ? 'database' : 'files' }));
+
+initStorage().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`CAAYO running on 0.0.0.0:${PORT}` + (db ? ' (database storage)' : ' (local file storage)'));
+  });
+}).catch(e => { console.error('Could not connect to the database:', e.message); process.exit(1); });
