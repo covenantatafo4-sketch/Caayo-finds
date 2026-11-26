@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>CAAYO Challenge – Win prizes</title>
+<meta name="description" content="Join the CAAYO challenge, invite friends and win prizes.">
+<link rel="icon" href="/favicon.png"><link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<style>
+:root{color-scheme:dark;--bg:#0c0c0e;--card:#141417;--line:#2a2a30;--tx:#fff;--mut:#a4a4b0;--btn:#fff;--btntx:#0c0c0e}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f4f4f6;--card:#fff;--line:#e2e2e9;--tx:#0f0f12;--mut:#6f6f7c;--btn:#0f0f12;--btntx:#fff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:Inter,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased;line-height:1.5}
+.wrap{max-width:560px;margin:0 auto;padding:calc(10px + env(safe-area-inset-top)) 16px calc(110px + env(safe-area-inset-bottom))}
+.bar{position:sticky;top:0;z-index:20;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;margin:0 -16px;padding:calc(8px + env(safe-area-inset-top)) 16px 8px;background:var(--bg)}.bar img{height:28px;display:block}
+.bar .bk,.bar .sh{font:inherit;font-size:13px;font-weight:700;color:var(--tx);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:8px 14px;background:transparent;cursor:pointer;justify-self:start}.bar .sh{justify-self:end}
+.wrap{padding-top:0}.jump{display:flex;gap:8px;overflow-x:auto;margin:0 -16px 6px;padding:2px 16px 8px;scrollbar-width:none;position:sticky;top:calc(46px + env(safe-area-inset-top));z-index:19;background:var(--bg)}.jump::-webkit-scrollbar{display:none}.jump a{flex:none;color:var(--tx);text-decoration:none;font-size:13px;font-weight:600;border:1px solid var(--line);border-radius:999px;padding:7px 14px}
+.card,.hero{scroll-margin-top:110px}
+.mine .code{font-size:30px;font-weight:900;letter-spacing:3px;word-break:break-all;line-height:1.1}.mine .lnk{font-size:12.5px;color:var(--mut);word-break:break-all;margin:4px 0 12px}.mine .acts{display:flex;gap:8px}.mine .acts>*{flex:1;text-align:center;text-decoration:none;border-radius:12px;padding:12px 6px;font:inherit;font-size:13px;font-weight:800;letter-spacing:.5px;border:1.5px solid var(--line);background:transparent;color:var(--tx);cursor:pointer}.mine .acts .pri{background:var(--btn);color:var(--btntx);border-color:var(--btn)}
+.big{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.big div{border:1px solid var(--line);border-radius:14px;padding:12px 8px;text-align:center}.big b{display:block;font-size:30px;font-weight:900;line-height:1.1}.big span{font-size:11.5px;color:var(--mut)}
+.bk2{margin-top:12px;border:1px solid var(--line);border-radius:14px;padding:12px 12px 4px}.bk2>div{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13.5px}.bk2>div small{display:block;font-size:11.5px;color:var(--mut)}.bk2>div>b{font-size:16px}.bk2 .tot{border:0;font-weight:900}.bk2 .tot b{font-size:20px}
+.hero{position:relative;overflow:hidden;border-radius:22px;padding:22px 18px 18px;color:#fff;background:radial-gradient(130% 120% at 0% 0%,#3d3d3d 0%,#121212 52%,#000 100%);border:1px solid rgba(255,255,255,.2)}
+.hero img.pic{display:block;width:calc(100% + 36px);margin:-22px -18px 16px;max-height:300px;object-fit:cover}
+.eb{font-size:10px;letter-spacing:2.4px;font-weight:800;opacity:.72;text-transform:uppercase}
+h1{margin:6px 0 12px;font-size:28px;line-height:1.12;letter-spacing:-.4px}
+.chips{display:flex;flex-wrap:wrap;gap:6px 0;font-size:13px;font-weight:600;opacity:.88}.chips span+span{margin-left:11px;padding-left:11px;border-left:1px solid rgba(255,255,255,.3)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;margin-top:12px;font-size:14.5px}
+.lbl{display:block;font-size:10px;letter-spacing:2px;font-weight:800;color:var(--mut);text-transform:uppercase;margin-bottom:10px}
+.pre{white-space:pre-line}
+.gifts{display:flex;gap:12px;overflow-x:auto;padding-bottom:6px;margin-bottom:8px;scrollbar-width:none}.gifts::-webkit-scrollbar{display:none}
+.gift{flex:0 0 auto;width:104px;text-align:center;font-size:12.5px;line-height:1.25}.gift img{display:block;width:104px;height:104px;object-fit:cover;border-radius:14px;border:1px solid var(--line);background:#fff;margin-bottom:6px}
+.steps{display:flex;flex-direction:column;gap:12px}.step{display:flex;gap:12px;align-items:flex-start}.step i{flex:0 0 auto;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-style:normal;font-weight:900;font-size:13px;background:var(--btn);color:var(--btntx)}
+.row{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}.row:last-child{border:0}.rk{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--line);font-size:12px;font-weight:800;font-style:normal;margin-right:10px}.rk.t1{background:var(--btn);color:var(--btntx)}
+.hint{font-size:12.5px;color:var(--mut);margin-top:10px}
+details summary{cursor:pointer;font-weight:800;font-size:13px;letter-spacing:.4px}details ul{margin:10px 0 0;padding-left:18px;font-size:13px;color:var(--mut)}details li{margin-bottom:5px}
+.cta{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--bg);border-top:1px solid var(--line)}
+.cta div{max-width:560px;margin:0 auto;display:flex;gap:10px}
+.btn{flex:1;display:block;text-align:center;text-decoration:none;border:0;border-radius:14px;padding:15px;font-size:14px;font-weight:800;letter-spacing:.8px;background:var(--btn);color:var(--btntx);cursor:pointer;font-family:inherit}
+.btn.ghost{flex:0 0 auto;padding:15px 20px;background:transparent;color:var(--tx);border:1.5px solid var(--line)}
+.msg{text-align:center;padding:60px 10px;color:var(--mut)}
+.sk{height:150px;border-radius:22px;background:var(--card);animation:p 1.2s infinite alternate}@keyframes p{to{opacity:.5}}
+</style></head><body>
+<div class="wrap">
+  <div class="bar"><button type="button" class="bk" onclick="goBack()" aria-label="Back">← Back</button><a href="/" class="lg" aria-label="CAAYO home"><img src="/logo.png" alt="CAAYO"></a><a href="/" class="sh">Shop</a></div><nav class="jump" id="jump" hidden></nav>
+  <div id="app"><div class="sk"></div></div>
+</div>
+<div class="cta" id="cta" hidden><div><a class="btn" id="join" href="/?challenge=1"></a><button class="btn ghost" id="share" type="button">SHARE</button></div></div>
+<script>
+function goBack(){try{if(history.length>1&&document.referrer&&new URL(document.referrer).origin===location.origin){history.back();return}}catch(e){}location.href='/'}
+const API=(location.hostname.endsWith('workers.dev')||location.hostname.endsWith('pages.dev'))?'https://caayo-finds-tr6y.onrender.com':'';
+const $=id=>document.getElementById(id);
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const img=u=>{const m=String(u||'').match(/\/uploads\/([a-f0-9]{16}\.(?:jpg|png|webp))$/i);return m?API+'/uploads/'+m[1]:u};
+const naira=n=>'₦'+Number(n||0).toLocaleString('en-NG');
+const dt=v=>v?new Date(v).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'}):'';
+function left(c){if(!c.endsAt)return'';const ms=Date.parse(c.endsAt)-Date.now();if(ms<=0)return'';const d=Math.ceil(ms/864e5);return d+(d===1?' day':' days')+' left'}
+function steps(c){const l=c.steps&&c.steps.length?c.steps.map(esc):['Join free and choose your own referral name.','Share your link. Every friend who signs up with it gives you <b>'+c.ptsSignup+' point'+(c.ptsSignup===1?'':'s')+'</b>.','Every friend who pays an order of <b>'+naira(c.minOrder)+' or more</b> gives you <b>'+c.ptsOrder+' points</b>.'];return'<div class="steps">'+l.map((t,i)=>'<div class="step"><i>'+(i+1)+'</i><div>'+t+'</div></div>').join('')+'</div>'}
+function rules(c){if(c.rules&&c.rules.length)return c.rules.map(t=>'<li>'+esc(t)+'</li>').join('');return'<li>Runs '+(c.startsAt?'from '+dt(c.startsAt)+' ':'')+(c.endsAt?'until '+dt(c.endsAt):'')+'. '+c.winners+' winner'+(c.winners>1?'s are':' is')+' drawn at random, weighted by points.</li><li>A friend\'s order counts once, after the 24-hour cancel window. Cancelled or refunded orders do not count.</li><li>Signing up yourself, fake, repeated or temporary-email accounts do not count, and can be disqualified.</li><li>Your referral name is yours alone.</li>'}
+function render(c){
+  document.title=c.title+' – CAAYO';
+  const ph=c.phase,live=c.enabled&&(ph==='running'||ph==='soon'||ph==='ended'||ph==='drawn');
+  if(!live){$('app').innerHTML='<div class="msg"><h2 style="color:var(--tx)">No challenge right now</h2>Check back soon, new prizes are coming.<br><br><a class="btn" style="display:inline-block;padding:14px 28px" href="/">GO TO THE SHOP</a></div>';return}
+  const l=left(c),gifts=(c.prizeItems||[]).filter(i=>i.image).map(i=>'<div class="gift"><img loading="lazy" src="'+esc(img(i.image))+'" alt="'+esc(i.name)+'">'+esc(i.name)+(i.mode==='random'?' <span style="opacity:.6">(random model)</span>':'')+'</div>').join('');
+  let status='';
+  if(ph==='soon')status='<div class="card">Starts on <b>'+esc(dt(c.startsAt))+'</b>.</div>';
+  else if(ph==='ended')status='<div class="card">The challenge has ended. Winners will be drawn soon.</div>';
+  else if(ph==='drawn')status='<div class="card"><span class="lbl">Winners</span>'+c.winnersList.map(w=>'<div class="row" style="flex-wrap:wrap"><span>🏆 '+esc(w.name)+'</span><span>'+w.points+' points</span>'+(w.gifts&&w.gifts.length?'<span style="width:100%;color:var(--mut);font-size:13px">Wins: '+esc(w.gifts.join(' + '))+'</span>':'')+'</div>').join('')+'<div class="hint">We contact the winners by phone and email.</div></div>';
+  $('app').innerHTML=
+   '<div class="hero">'+(c.image?'<img class="pic" src="'+esc(img(c.image))+'" alt="">':'')+'<div class="eb">'+esc(c.bannerTitle||'Influencer challenge')+'</div><h1>'+esc(c.title)+'</h1><div class="chips"><span>'+c.winners+' winner'+(c.winners>1?'s':'')+'</span>'+(l?'<span>'+l+'</span>':'')+(c.participants?'<span>'+c.participants+' joined</span>':'')+'</div></div>'
+   +(c.pageIntro?'<div class="card pre">'+esc(c.pageIntro)+'</div>':'')
+   +'<div class="card" id="prize"><span class="lbl">The prize'+(c.winners>1?' · for each winner':'')+'</span>'+(gifts?'<div class="gifts">'+gifts+'</div>':'')+'<div>'+esc(c.prize)+'</div></div>'
+   +status
+   +'<div id="mine"></div><div class="card" id="how"><span class="lbl">How to win</span>'+steps(c)+'<div class="hint">Each point is one ticket in the prize draw, so more points means better odds.</div></div>'
+   +(c.board&&c.board.length?'<div class="card" id="board"><span class="lbl">Top of the board</span>'+c.board.map((r,i)=>'<div class="row"><span><i class="rk'+(i===0?' t1':'')+'">'+(i+1)+'</i>'+esc(r.name)+'</span><span><b>'+r.points+'</b> pts</span></div>').join('')+'</div>':'')
+   +(c.extras||[]).map(x=>'<div class="card">'+(x.title?'<span class="lbl">'+esc(x.title)+'</span>':'')+(x.text?'<div class="pre">'+esc(x.text)+'</div>':'')+'</div>').join('')
+   +'<details class="card" id="rules"><summary>Rules</summary><ul>'+rules(c)+'</ul></details>';
+  $('join').textContent=ph==='drawn'?'BACK TO THE SHOP':(ph==='running'?(c.bannerButton||'Join the challenge').toUpperCase():'OPEN THE SHOP');
+  $('join').href=ph==='running'?'/?challenge=1':'/';$('cta').hidden=false;
+  const J=[['prize','Prize']];if(ph==='running')J.push(['mine','My link']);J.push(['how','How to win']);if(c.board&&c.board.length)J.push(['board','Leaderboard']);J.push(['rules','Rules']);
+  $('jump').innerHTML=J.map(x=>'<a href="#'+x[0]+'">'+x[1]+'</a>').join('');$('jump').hidden=false;
+  if(ph==='running')loadMine(c);
+}
+function loadMine(c){let A=null;try{A=JSON.parse(localStorage.getItem('caayoAuth'))}catch(e){}
+  const box=$('mine');if(!box)return;
+  if(!A||!A.token){box.innerHTML='<div class="card"><span class="lbl">Your referral link</span>Log in or create a free account to get your own link and start earning points.<div class="acts" style="margin-top:12px"><a class="btn" href="/?challenge=1">JOIN FREE</a></div></div>';return}
+  fetch(API+'/api/challenge/me',{headers:{Authorization:'Bearer '+A.token}}).then(r=>r.ok?r.json():null).then(M=>{
+    if(!M||!M.joined){box.innerHTML='<div class="card"><span class="lbl">Your referral link</span>You have not joined yet. Pick your own referral name and start inviting friends.<div style="margin-top:12px"><a class="btn" href="/?challenge=1">JOIN THE CHALLENGE</a></div></div>';return}
+    const link=location.origin+'/?ref='+M.code,msg='Shop on CAAYO and get great prices. Sign up with my link: '+link,a=M.signups*c.ptsSignup,b=M.bigOrders*c.ptsOrder,x=M.bonus||0;
+    box.innerHTML='<div class="card mine"><span class="lbl">Your referral link</span><div class="code">'+esc(M.code)+'</div><div class="lnk">'+esc(location.host+'/?ref='+M.code)+'</div>'
+     +'<div class="acts"><button class="pri" type="button" id="cp">COPY LINK</button><a target="_blank" rel="noopener" href="https://wa.me/?text='+encodeURIComponent(msg)+'">WHATSAPP</a></div>'
+     +(M.disqualified?'<div class="hint" style="color:#ff7a7a">Your entry was disqualified.</div>':'')
+     +'<div class="big"><div><b>'+M.points+'</b><span>Total points</span></div><div><b>'+(M.rank?'#'+M.rank:'–')+'</b><span>Your rank</span></div></div>'
+     +'<div class="bk2"><span class="lbl">How your points add up</span>'
+     +'<div><span>Friends who joined<small>'+M.signups+' × '+c.ptsSignup+' pt'+(c.ptsSignup===1?'':'s')+'</small></span><b>'+a+'</b></div>'
+     +'<div><span>Friends who ordered '+naira(c.minOrder)+'+<small>'+M.bigOrders+' × '+c.ptsOrder+' pts</small></span><b>'+b+'</b></div>'
+     +(x?'<div><span>Bonus points<small>from CAAYO</small></span><b>'+(x>0?'+':'')+x+'</b></div>':'')
+     +'<div class="tot"><span>Total</span><b>'+M.points+'</b></div></div></div>';
+    $('cp').onclick=async()=>{try{await navigator.clipboard.writeText(link);$('cp').textContent='COPIED ✓'}catch(e){prompt('Copy your link',link)}};
+  }).catch(()=>{})}
+$('share').onclick=async()=>{const u=location.origin+'/challenge';try{if(navigator.share){await navigator.share({title:document.title,url:u})}else{await navigator.clipboard.writeText(u);$('share').textContent='COPIED'}}catch(e){}};
+fetch(API+'/api/challenge').then(r=>r.json()).then(render).catch(()=>{$('app').innerHTML='<div class="msg">Could not load the challenge. Please refresh.</div>'});
+</script></body></html>
